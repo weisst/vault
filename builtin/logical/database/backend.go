@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/errwrap"
 	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/vault/builtin/logical/database/dbplugin"
 	"github.com/hashicorp/vault/helper/consts"
@@ -18,6 +19,7 @@ import (
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
 	"github.com/hashicorp/vault/plugins/helper/database/dbutil"
+	"github.com/mitchellh/mapstructure"
 )
 
 const (
@@ -277,9 +279,10 @@ func (b *databaseBackend) initQueue(ctx context.Context, conf *logical.BackendCo
 			b.credRotationQueue = queue.NewTimeQueue()
 		}
 
-		//
 		// read, process WAL logs
-		//
+		if err := b.queueWAL(ctx, conf); err != nil {
+			b.Logger().Warn("error loading WAL entries into queue", err)
+		}
 
 		ctx, cancel := context.WithCancel(context.Background())
 		b.cancelQueue = cancel
@@ -287,6 +290,77 @@ func (b *databaseBackend) initQueue(ctx context.Context, conf *logical.BackendCo
 		// launch ticker
 		go b.runTicker(ctx, conf.StorageView)
 	}
+}
+
+func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendConfig) error {
+	keys, err := framework.ListWAL(ctx, conf.StorageView)
+	if err != nil {
+		b.Logger().Info("error listing WAL entries")
+		return nil
+	}
+	if len(keys) == 0 {
+		b.Logger().Info("no WAL entries found")
+		return nil
+	}
+
+	// loop through WAL keys and process any rotation ones
+	var merr error
+	for _, k := range keys {
+		var entry walSetCredentials
+		walEntry, err := framework.GetWAL(ctx, conf.StorageView, k)
+		if err != nil {
+			merr = multierror.Append(merr, err)
+			continue
+		}
+		if walEntry == nil {
+			continue
+		}
+
+		if walEntry.Kind != "rotation" {
+			continue
+		}
+
+		if err := mapstructure.Decode(walEntry.Data, &entry); err != nil {
+			b.Logger().Warn("error decoding entry", err)
+			continue
+		}
+		// load matching role and verify
+		result, err := conf.StorageView.Get(ctx, "role/"+entry.RoleName)
+		if err != nil {
+			b.Logger().Warn("error loading role", err)
+			continue
+		}
+		if result == nil {
+			b.Logger().Info("no role found")
+			continue
+		}
+		var role roleEntry
+		if err := result.DecodeJSON(&role); err != nil {
+			b.Logger().Warn("error decoding role", err)
+			continue
+		}
+		if role.StaticAccount == nil {
+			b.Logger().Warn("role found, but no static account associated with it")
+			continue
+		}
+
+		if role.StaticAccount.LastVaultRotation.After(entry.LastVaultRotation) {
+			// role password has been rotated since the WAL was created, so let's
+			// delete this
+			if err == nil {
+				err = framework.DeleteWAL(ctx, conf.StorageView, k)
+			}
+		}
+
+		// handle WAL
+		if err == nil {
+			err = framework.DeleteWAL(ctx, conf.StorageView, k)
+		}
+		if err != nil {
+			merr = multierror.Append(merr, err)
+		}
+	}
+	return merr
 }
 
 // invalidateQueue cancels any background queue loading and destroys the queue.
@@ -371,7 +445,7 @@ the "database/config/" path.
 // populate queue loads the priority queue with existing static accounts.
 func (b *databaseBackend) populateQueue(ctx context.Context, s logical.Storage) {
 	log := b.Logger()
-	log.Info("restoring role rotation queue")
+	log.Info("populating role rotation queue")
 
 	roles, err := s.List(ctx, "role/")
 	if err != nil {
@@ -403,7 +477,6 @@ func (b *databaseBackend) populateQueue(ctx context.Context, s logical.Storage) 
 			log.Warn("unable to enqueue item", "error", err, "role", roleName)
 		}
 	}
-	log.Info("successfully restored role rotation queue")
 }
 
 // runTicker kicks off a periodic ticker that invoke the automatic credential
