@@ -28,6 +28,9 @@ const (
 
 	// interval to check the queue for items needing rotation
 	QueueTickInterval = 5 * time.Second
+
+	// key used for WAL entry kind information
+	walRotationKey = "staticRotationKey"
 )
 
 type dbPluginInstance struct {
@@ -266,6 +269,8 @@ func (b *databaseBackend) GetConnection(ctx context.Context, s logical.Storage, 
 // a go-routine, and does not wait for success or failure of it's tasks before
 // returning. This is to avoid blocking the mount process while loading and
 // evaluating existing roles, etc.
+//
+// TODO: verify initQueue results and/or active queue in periodic func
 func (b *databaseBackend) initQueue(ctx context.Context, conf *logical.BackendConfig) {
 	// verify this mount is on the primary server, or is a local mount. If not, do
 	// not create a queue or launch a ticker
@@ -284,6 +289,7 @@ func (b *databaseBackend) initQueue(ctx context.Context, conf *logical.BackendCo
 			b.Logger().Warn("error loading WAL entries into queue", err)
 		}
 
+		// load roles and populate queue
 		ctx, cancel := context.WithCancel(context.Background())
 		b.cancelQueue = cancel
 		b.populateQueue(ctx, conf.StorageView)
@@ -316,7 +322,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 			continue
 		}
 
-		if walEntry.Kind != "rotation" {
+		if walEntry.Kind != walRotationKey {
 			continue
 		}
 
@@ -324,6 +330,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 			b.Logger().Warn("error decoding entry", err)
 			continue
 		}
+
 		// load matching role and verify
 		result, err := conf.StorageView.Get(ctx, "role/"+entry.RoleName)
 		if err != nil {
@@ -332,6 +339,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 		}
 		if result == nil {
 			b.Logger().Info("no role found")
+			// TODO: delete WAL
 			continue
 		}
 		var role roleEntry
@@ -341,6 +349,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 		}
 		if role.StaticAccount == nil {
 			b.Logger().Warn("role found, but no static account associated with it")
+			// TODO: delete WAL
 			continue
 		}
 
@@ -496,4 +505,16 @@ func (b *databaseBackend) runTicker(ctx context.Context, s logical.Storage) {
 		}
 	}
 	return
+}
+
+// walSetCredentials is used to store information in a WAL that can retry a
+// credential setting or rotation in the event of partial failure.
+type walSetCredentials struct {
+	Username          string    `json:"username"`
+	NewPassword       string    `json:"new_password"`
+	OldPassword       string    `json:"old_password"`
+	RoleName          string    `json:"role_name"`
+	Statements        []string  `json:"statements"`
+	LastVaultRotation time.Time `json:"last_vault_rotation"`
+	Attempts          int       `json:"attempts"`
 }
