@@ -259,11 +259,11 @@ func (b *databaseBackend) pathRoleCreateUpdate(ctx context.Context, req *logical
 		}
 		if ok {
 			rotationPeriodSeconds := rotationPeriodSecondsRaw.(int)
-			if rotationPeriodSeconds < 60 {
+			if rotationPeriodSeconds < 5 {
 				// If rotation frequency is specified, and this is an update, the value
-				// must be at least 60 seconds because our periodic func runs about once a
+				// must be at least 5 seconds because our periodic func runs about once a
 				// minute.
-				return logical.ErrorResponse("rotation_period must be 60 seconds or more"), nil
+				return logical.ErrorResponse("rotation_period must be 5 seconds or more"), nil
 			}
 			role.StaticAccount.RotationPeriod = time.Duration(rotationPeriodSeconds) * time.Second
 		}

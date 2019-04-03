@@ -1608,19 +1608,31 @@ DROP ROLE IF EXISTS {{name}};
 //
 // WAL testing
 //
-func TestBackend_Static_QueueWAL(t *testing.T) {
+// First scenario, WAL contains a role name that does not exist.
+func TestBackend_Static_QueueWAL_discard_role_not_found(t *testing.T) {
 	cluster, sys := getCluster(t)
 	defer cluster.Cleanup()
+
+	ctx := context.Background()
 
 	config := logical.TestBackendConfig()
 	config.StorageView = &logical.InmemStorage{}
 	config.System = sys
 
-	b, err := Factory(context.Background(), config)
+	_, err := framework.PutWAL(ctx, config.StorageView, walRotationKey, &walSetCredentials{
+		RoleName: "doesnotexist",
+	})
+	if err != nil {
+		t.Fatalf("error with PutWAL: %s", err)
+	}
+
+	assertWALCount(t, config.StorageView, 1)
+
+	b, err := Factory(ctx, config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer b.Cleanup(context.Background())
+	defer b.Cleanup(ctx)
 
 	cleanup, _ := preparePostgresTestContainer(t, config.StorageView, b)
 	defer cleanup()
@@ -1631,8 +1643,173 @@ func TestBackend_Static_QueueWAL(t *testing.T) {
 		t.Fatal("database backend had no credential rotation queue")
 	}
 
-	if bd.credRotationQueue.Len() != 1 {
+	// verify empty queue
+	if bd.credRotationQueue.Len() != 0 {
 		t.Fatalf("expected zero queue items, got: %d", bd.credRotationQueue.Len())
+	}
+
+	assertWALCount(t, config.StorageView, 0)
+}
+
+// Second scenario, WAL contains a role name that does exist, but the role's
+// LastVaultRotation is greater than the WAL has
+func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) {
+	cluster, sys := getCluster(t)
+	defer cluster.Cleanup()
+
+	ctx := context.Background()
+
+	config := logical.TestBackendConfig()
+	config.StorageView = &logical.InmemStorage{}
+	config.System = sys
+
+	roleName := "testupdated"
+	lb, err := Factory(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, ok := lb.(*databaseBackend)
+	if !ok {
+		t.Fatal("could not convert to db backend")
+	}
+	// defer b.Cleanup(ctx)
+
+	cleanup, connURL := preparePostgresTestContainer(t, config.StorageView, b)
+	defer cleanup()
+
+	// Configure a connection
+	data := map[string]interface{}{
+		"connection_url":    connURL,
+		"plugin_name":       "postgresql-database-plugin",
+		"verify_connection": false,
+		"allowed_roles":     []string{"*"},
+		"name":              "plugin-test",
+	}
+	req := &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "config/plugin-test",
+		Storage:   config.StorageView,
+		Data:      data,
+	}
+	resp, err := b.HandleRequest(namespace.RootContext(nil), req)
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("err:%s resp:%#v\n", err, resp)
+	}
+
+	// save Now() to make sure rotation time is after this, as well as the WAL
+	// time
+	roleTime := time.Now()
+	// create role
+	data = map[string]interface{}{
+		"name":                  roleName,
+		"db_name":               "plugin-test",
+		"creation_statements":   testRoleStaticCreate,
+		"rotation_statements":   testRoleStaticUpdate,
+		"revocation_statements": defaultRevocationSQL,
+		"default_ttl":           "5m",
+		"max_ttl":               "10m",
+		"username":              "statictest",
+		// low value here, to make sure the backend rotates this password at least
+		// once before we compare it to the WAL
+		"rotation_period": "10s",
+	}
+
+	req = &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "roles/" + roleName,
+		Storage:   config.StorageView,
+		Data:      data,
+	}
+
+	resp, err = b.HandleRequest(namespace.RootContext(nil), req)
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("err:%s resp:%#v\n", err, resp)
+	}
+
+	time.Sleep(time.Second * 10)
+
+	// cleanup the backend, then create a WAL for the role with a
+	// LastVaultRotation of 1 hour ago, so that when we recreate the backend the
+	// WAL will be read but discarded
+	b.Cleanup(ctx)
+	b = nil
+	time.Sleep(time.Second * 3)
+
+	oldRotationTime := time.Now().Add(time.Hour * -1)
+	_, err = framework.PutWAL(ctx, config.StorageView, walRotationKey, &walSetCredentials{
+		RoleName:          roleName,
+		NewPassword:       "strongpassword",
+		OldPassword:       "weakpassword",
+		LastVaultRotation: oldRotationTime,
+	})
+	if err != nil {
+		t.Fatalf("error with PutWAL: %s", err)
+	}
+
+	assertWALCount(t, config.StorageView, 1)
+
+	// reload backend
+	lb, err = Factory(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, ok = lb.(*databaseBackend)
+	if !ok {
+		t.Fatal("could not convert to db backend")
+	}
+	defer b.Cleanup(ctx)
+
+	// allow enough time for queueWAL to work after boot
+	time.Sleep(time.Second * 12)
+
+	assertWALCount(t, config.StorageView, 0)
+
+	// Read the role
+	data = map[string]interface{}{}
+	req = &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "roles/" + roleName,
+		Storage:   config.StorageView,
+		Data:      data,
+	}
+	resp, err = b.HandleRequest(namespace.RootContext(nil), req)
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("err:%s resp:%#v\n", err, resp)
+	}
+
+	lastVaultRotation := resp.Data["last_vault_rotation"].(time.Time)
+	if !lastVaultRotation.After(oldRotationTime) {
+		t.Fatal("last vault rotation time not greater than WAL time")
+	}
+
+	if !lastVaultRotation.After(roleTime) {
+		t.Fatal("last vault rotation time not greater than role creation time")
+	}
+}
+
+// helper to assert the number of WAL entries is what we expect
+func assertWALCount(t *testing.T, s logical.Storage, expected int) {
+	ctx := context.Background()
+	keys, err := framework.ListWAL(ctx, s)
+	if err != nil {
+		t.Fatal("error listing WALs")
+	}
+
+	// loop through WAL keys and process any rotation ones
+	var count int
+	for _, k := range keys {
+		walEntry, _ := framework.GetWAL(ctx, s, k)
+		if walEntry == nil {
+			continue
+		}
+
+		if walEntry.Kind != walRotationKey {
+			continue
+		}
+		count++
+	}
+	if expected != count {
+		t.Fatalf("WAL count mismatch, expected (%d), got (%d)", expected, count)
 	}
 }
 

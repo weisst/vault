@@ -330,8 +330,8 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 			continue
 		}
 
-		if err := mapstructure.Decode(walEntry.Data, &entry); err != nil {
-			b.Logger().Warn("error decoding entry", err)
+		if mapErr := mapstructure.Decode(walEntry.Data, &entry); err != nil {
+			b.Logger().Warn("error decoding entry", mapErr.Error())
 			continue
 		}
 
@@ -342,8 +342,8 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 			continue
 		}
 
-		if role.StaticAccount == nil {
-			b.Logger().Warn("role found, but no static account associated with it")
+		if role == nil || role.StaticAccount == nil {
+			b.Logger().Warn("role or static account not found")
 			if err = framework.DeleteWAL(ctx, conf.StorageView, k); err != nil {
 				b.Logger().Warn("error deleting WAL for role with no static account", err)
 			}
@@ -476,6 +476,10 @@ func (b *databaseBackend) populateQueue(ctx context.Context, s logical.Storage) 
 			continue
 		}
 
+		// guard against a nil queue
+		if b.credRotationQueue == nil {
+			b.credRotationQueue = queue.NewTimeQueue()
+		}
 		if err := b.credRotationQueue.PushItem(&queue.Item{
 			Key:      roleName,
 			Priority: role.StaticAccount.LastVaultRotation.Add(role.StaticAccount.RotationPeriod).Unix(),
@@ -507,11 +511,11 @@ func (b *databaseBackend) runTicker(ctx context.Context, s logical.Storage) {
 // walSetCredentials is used to store information in a WAL that can retry a
 // credential setting or rotation in the event of partial failure.
 type walSetCredentials struct {
-	Username          string    `json:"username"`
-	NewPassword       string    `json:"new_password"`
-	OldPassword       string    `json:"old_password"`
-	RoleName          string    `json:"role_name"`
-	Statements        []string  `json:"statements"`
-	LastVaultRotation time.Time `json:"last_vault_rotation"`
-	Attempts          int       `json:"attempts"`
+	Username          string
+	NewPassword       string
+	OldPassword       string
+	RoleName          string
+	Statements        []string
+	LastVaultRotation time.Time
+	Attempts          int
 }
