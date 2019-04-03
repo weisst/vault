@@ -1391,6 +1391,7 @@ func TestBackend_PeriodicFunc(t *testing.T) {
 	}
 	defer b.Cleanup(context.Background())
 
+	// TODO: verify this is needed
 	time.Sleep(1 * time.Second)
 	bd := b.(*databaseBackend)
 	if bd.credRotationQueue == nil {
@@ -1603,3 +1604,38 @@ REVOKE USAGE ON SCHEMA public FROM {{name}};
 
 DROP ROLE IF EXISTS {{name}};
 `
+
+//
+// WAL testing
+//
+func TestBackend_Static_QueueWAL(t *testing.T) {
+	cluster, sys := getCluster(t)
+	defer cluster.Cleanup()
+
+	config := logical.TestBackendConfig()
+	config.StorageView = &logical.InmemStorage{}
+	config.System = sys
+
+	b, err := Factory(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Cleanup(context.Background())
+
+	cleanup, _ := preparePostgresTestContainer(t, config.StorageView, b)
+	defer cleanup()
+
+	time.Sleep(1 * time.Second)
+	bd := b.(*databaseBackend)
+	if bd.credRotationQueue == nil {
+		t.Fatal("database backend had no credential rotation queue")
+	}
+
+	if bd.credRotationQueue.Len() != 1 {
+		t.Fatalf("expected zero queue items, got: %d", bd.credRotationQueue.Len())
+	}
+}
+
+//
+// end WAL testing
+//

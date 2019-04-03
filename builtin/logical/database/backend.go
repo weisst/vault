@@ -298,11 +298,15 @@ func (b *databaseBackend) initQueue(ctx context.Context, conf *logical.BackendCo
 	}
 }
 
+// queueWAL reads WAL entries at backend initialization. If WAL entries for
+// static account rotation are round, attempt to re-set the password for the
+// role given the NewPassword stored in the WAL. If the matching Role does not
+// exist, the Role's LastVaultRotation is newer than the WAL,  or the Role does
+// not have a static account, delete the WAL.
 func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendConfig) error {
 	keys, err := framework.ListWAL(ctx, conf.StorageView)
 	if err != nil {
-		b.Logger().Info("error listing WAL entries")
-		return nil
+		return err
 	}
 	if len(keys) == 0 {
 		b.Logger().Info("no WAL entries found")
@@ -332,24 +336,17 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 		}
 
 		// load matching role and verify
-		result, err := conf.StorageView.Get(ctx, "role/"+entry.RoleName)
+		role, err := b.Role(ctx, conf.StorageView, entry.RoleName)
 		if err != nil {
 			b.Logger().Warn("error loading role", err)
 			continue
 		}
-		if result == nil {
-			b.Logger().Info("no role found")
-			// TODO: delete WAL
-			continue
-		}
-		var role roleEntry
-		if err := result.DecodeJSON(&role); err != nil {
-			b.Logger().Warn("error decoding role", err)
-			continue
-		}
+
 		if role.StaticAccount == nil {
 			b.Logger().Warn("role found, but no static account associated with it")
-			// TODO: delete WAL
+			if err = framework.DeleteWAL(ctx, conf.StorageView, k); err != nil {
+				b.Logger().Warn("error deleting WAL for role with no static account", err)
+			}
 			continue
 		}
 
