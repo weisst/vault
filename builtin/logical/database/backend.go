@@ -339,6 +339,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 		role, err := b.Role(ctx, conf.StorageView, entry.RoleName)
 		if err != nil {
 			b.Logger().Warn("error loading role", err)
+			merr = multierror.Append(merr, err)
 			continue
 		}
 
@@ -346,6 +347,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 			b.Logger().Warn("role or static account not found")
 			if err = framework.DeleteWAL(ctx, conf.StorageView, k); err != nil {
 				b.Logger().Warn("error deleting WAL for role with no static account", err)
+				merr = multierror.Append(merr, err)
 			}
 			continue
 		}
@@ -353,9 +355,78 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 		if role.StaticAccount.LastVaultRotation.After(entry.LastVaultRotation) {
 			// role password has been rotated since the WAL was created, so let's
 			// delete this
-			if err == nil {
-				err = framework.DeleteWAL(ctx, conf.StorageView, k)
+			err = framework.DeleteWAL(ctx, conf.StorageView, k)
+			if err != nil {
+				merr = multierror.Append(merr, err)
 			}
+		}
+
+		// WAL entry's LastVaultRotation is newer, so we attempt to set NewPassword
+		// again on the database user, then update Vault storage
+
+		// veryify role is still in Allowed Roles
+		{
+			dbConfig, err := b.DatabaseConfig(ctx, conf.StorageView, role.DBName)
+			if err != nil {
+				b.Logger().Warn("error getting database configuration")
+				merr = multierror.Append(merr, err)
+				continue
+			}
+
+			// If role name isn't in the database's allowed roles, delete the WAL
+			if !strutil.StrListContains(dbConfig.AllowedRoles, "*") && !strutil.StrListContainsGlob(dbConfig.AllowedRoles, entry.RoleName) {
+				b.Logger().Warn("error getting database configuration")
+				err = framework.DeleteWAL(ctx, conf.StorageView, k)
+				if err != nil {
+					b.Logger().Warn("error deleting WAL", err)
+				}
+				continue
+			}
+		}
+
+		// Get the Database object, and set the new password
+		{
+			db, err := b.GetConnection(ctx, conf.StorageView, role.DBName)
+			if err != nil {
+				b.Logger().Warn("error getting database connection", err)
+				err = framework.DeleteWAL(ctx, conf.StorageView, k)
+				if err != nil {
+					b.Logger().Warn("error deleting WAL", err)
+				}
+				continue
+			}
+
+			db.RLock()
+			defer db.RUnlock()
+
+			config := dbplugin.StaticUserConfig{
+				Username: role.StaticAccount.Username,
+				Password: entry.NewPassword,
+			}
+
+			_, _, _, err = db.SetCredentials(ctx, config, role.Statements.Rotation)
+			if err != nil {
+				b.CloseIfShutdown(db, err)
+				b.Logger().Warn("error setting new password from WAL", err)
+				err = framework.DeleteWAL(ctx, conf.StorageView, k)
+				if err != nil {
+					b.Logger().Warn("error deleting WAL", err)
+				}
+				continue
+			}
+		}
+
+		// Store updated role information
+		role.StaticAccount.LastVaultRotation = time.Now()
+		role.StaticAccount.Password = entry.NewPassword
+
+		roleEntry, err := logical.StorageEntryJSON("role/"+entry.RoleName, role)
+		if err != nil {
+			merr = multierror.Append(merr, err)
+			continue
+		}
+		if err := conf.StorageView.Put(ctx, roleEntry); err != nil {
+			merr = multierror.Append(merr, err)
 		}
 
 		// handle WAL

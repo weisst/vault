@@ -1672,6 +1672,7 @@ func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) 
 	if !ok {
 		t.Fatal("could not convert to db backend")
 	}
+	// manually clean up
 	// defer b.Cleanup(ctx)
 
 	cleanup, connURL := preparePostgresTestContainer(t, config.StorageView, b)
@@ -1699,6 +1700,7 @@ func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) 
 	// save Now() to make sure rotation time is after this, as well as the WAL
 	// time
 	roleTime := time.Now()
+
 	// create role
 	data = map[string]interface{}{
 		"name":                  roleName,
@@ -1735,6 +1737,7 @@ func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) 
 	b = nil
 	time.Sleep(time.Second * 3)
 
+	// make a fake WAL entry with an older time
 	oldRotationTime := time.Now().Add(time.Hour * -1)
 	_, err = framework.PutWAL(ctx, config.StorageView, walRotationKey, &walSetCredentials{
 		RoleName:          roleName,
@@ -1762,6 +1765,7 @@ func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) 
 	// allow enough time for queueWAL to work after boot
 	time.Sleep(time.Second * 12)
 
+	// queueWAL should have processed the entry and removed the WAL log by now
 	assertWALCount(t, config.StorageView, 0)
 
 	// Read the role
