@@ -2,7 +2,6 @@ package database
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -359,24 +358,27 @@ func (b *databaseBackend) pathRoleCreateUpdate(ctx context.Context, req *logical
 
 		// only call createUpdateStaticAccount if we're creating the role for the
 		// first time
-		if req.Operation == logical.CreateOperation {
-			lvr, err = b.createUpdateStaticAccount(ctx, req.Storage, name, role, createRole)
+		switch req.Operation {
+		case logical.CreateOperation:
+			resp, err := b.createUpdateStaticAccount(ctx, req.Storage, &setPasswordInput{
+				RoleName:   name,
+				Role:       role,
+				CreateUser: createRole,
+			})
 			if err != nil {
 				return nil, err
 			}
-		}
-
-		// Re-init queue if it was invalidated
-		// b.Lock()
-		// if b.credRotationQueue == nil {
-		// 	b.initQueue(req.Storage)
-		// }
-		// b.Unlock()
-
-		// In case this is an update, remove any previous version of the item from the queue
-		if _, err := b.credRotationQueue.PopItemByKey(name); err != nil {
-			if _, ok := err.(*queue.ErrItemNotFound); !ok {
-				return nil, err
+			// guard against RotationTime not being set or zero-value
+			lvr = resp.RotationTime
+			if lvr.IsZero() {
+				lvr = time.Now()
+			}
+		case logical.UpdateOperation:
+			// In case this is an update, remove any previous version of the item from the queue
+			if _, err := b.credRotationQueue.PopItemByKey(name); err != nil {
+				if _, ok := err.(*queue.ErrItemNotFound); !ok {
+					return nil, err
+				}
 			}
 		}
 
@@ -401,73 +403,6 @@ func (b *databaseBackend) pathRoleCreateUpdate(ctx context.Context, req *logical
 	}
 
 	return nil, nil
-}
-
-func (b *databaseBackend) createUpdateStaticAccount(ctx context.Context, s logical.Storage, name string, role *roleEntry, createUser bool) (time.Time, error) {
-	var lvr time.Time
-	dbConfig, err := b.DatabaseConfig(ctx, s, role.DBName)
-	if err != nil {
-		return lvr, err
-	}
-
-	// If role name isn't in the database's allowed roles, send back a
-	// permission denied.
-	if !strutil.StrListContains(dbConfig.AllowedRoles, "*") && !strutil.StrListContainsGlob(dbConfig.AllowedRoles, name) {
-		return lvr, fmt.Errorf("%q is not an allowed role", name)
-	}
-
-	// Get the Database object
-	db, err := b.GetConnection(ctx, s, role.DBName)
-	if err != nil {
-		return lvr, err
-	}
-
-	// Generate a new password
-	password, err := db.GenerateCredentials(ctx)
-	if err != nil {
-		return lvr, err
-	}
-
-	db.RLock()
-	defer db.RUnlock()
-
-	config := dbplugin.StaticUserConfig{
-		Username: role.StaticAccount.Username,
-		Password: password,
-	}
-
-	// Create or rotate the user
-	stmts := role.Statements.Creation
-	if !createUser {
-		stmts = role.Statements.Rotation
-	}
-
-	var sterr error
-	_, newPassword, _, sterr := db.SetCredentials(ctx, config, stmts)
-	if sterr != nil {
-		b.CloseIfShutdown(db, sterr)
-		return lvr, sterr
-	}
-
-	// TODO set credentials doesn't need to return all these things
-	if newPassword != password {
-		return lvr, errors.New("mismatch password returned")
-	}
-
-	// Store updated role information
-	lvr = time.Now()
-	role.StaticAccount.LastVaultRotation = lvr
-	role.StaticAccount.Password = password
-
-	entry, err := logical.StorageEntryJSON("role/"+name, role)
-	if err != nil {
-		return lvr, err
-	}
-	if err := s.Put(ctx, entry); err != nil {
-		return lvr, err
-	}
-
-	return lvr, nil
 }
 
 type roleEntry struct {

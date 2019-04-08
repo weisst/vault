@@ -2,14 +2,21 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/hashicorp/vault/builtin/logical/database/dbplugin"
 	"github.com/hashicorp/vault/helper/queue"
+	"github.com/hashicorp/vault/helper/strutil"
 	"github.com/hashicorp/vault/logical"
+	"github.com/hashicorp/vault/logical/framework"
+	"github.com/mitchellh/mapstructure"
 )
 
-// rotateCredentials sets a new password for a static account
+// rotateCredentials sets a new password for a static account. This method is
+// invoked by a go-routine launched the runTicker method, and invoked
+// periodically (approximately every 5 seconds).
 // This will loop until either:
 // - The queue of passwords needing rotation is completely empty.
 // - It encounters the first password not yet needing rotation.
@@ -35,9 +42,21 @@ func (b *databaseBackend) rotateCredentials(ctx context.Context, s logical.Stora
 
 		if time.Now().Unix() > item.Priority {
 			// We've found our first item not in need of rotation
+			input := &setPasswordInput{
+				RoleName: item.Key,
+				Role:     role,
+			}
+
+			// check for existing WAL entry with a Password
+			if value, ok := item.Value.(string); ok {
+				walEntry := b.walForItemValue(ctx, s, value)
+				if walEntry != nil && walEntry.NewPassword != "" {
+					input.Password = walEntry.NewPassword
+				}
+			}
 
 			// lvr is the roles' last vault rotation
-			lvr, err := b.createUpdateStaticAccount(ctx, s, item.Key, role, false)
+			resp, err := b.createUpdateStaticAccount(ctx, s, input)
 			if err != nil {
 				b.logger.Warn("unable rotate credentials in periodic function", "error", err)
 				// add the item to the re-queue slice
@@ -50,6 +69,12 @@ func (b *databaseBackend) rotateCredentials(ctx context.Context, s logical.Stora
 				}
 				// go to next item
 				continue
+			}
+
+			// guard against RotationTime not being set or zero-value
+			lvr := resp.RotationTime
+			if lvr.IsZero() {
+				lvr = time.Now()
 			}
 
 			nextRotation := lvr.Add(role.StaticAccount.RotationPeriod)
@@ -68,4 +93,115 @@ func (b *databaseBackend) rotateCredentials(ctx context.Context, s logical.Stora
 		}
 	}
 	return nil
+}
+
+func (b *databaseBackend) walForItemValue(ctx context.Context, s logical.Storage, id string) *walSetCredentials {
+	// TODO: use and return multi-error here
+	wal, err := framework.GetWAL(ctx, s, id)
+	if err != nil {
+		b.Logger().Warn(fmt.Sprintf("error reading WAL for ID (%s):", id), err)
+		return nil
+	}
+
+	if wal != nil || wal.Kind != walRotationKey {
+		return nil
+	}
+
+	var walEntry walSetCredentials
+	if mapErr := mapstructure.Decode(wal.Data, &walEntry); err != nil {
+		b.Logger().Warn("error decoding walEntry", mapErr.Error())
+		return nil
+	}
+
+	return &walEntry
+}
+
+// TODO: rename to match the method these go with
+type setPasswordInput struct {
+	RoleName   string
+	Role       *roleEntry
+	Password   string
+	CreateUser bool
+	WALID      string
+}
+
+type setPasswordResponse struct {
+	RotationTime time.Time
+	// Optional return field, in the event WAL was created and not destroyed
+	// during the operation
+	WALID string
+}
+
+func (b *databaseBackend) createUpdateStaticAccount(ctx context.Context, s logical.Storage, input *setPasswordInput) (*setPasswordResponse, error) {
+	var lvr time.Time
+	dbConfig, err := b.DatabaseConfig(ctx, s, input.Role.DBName)
+	if err != nil {
+		return nil, err
+	}
+
+	// If role name isn't in the database's allowed roles, send back a
+	// permission denied.
+	if !strutil.StrListContains(dbConfig.AllowedRoles, "*") && !strutil.StrListContainsGlob(dbConfig.AllowedRoles, input.RoleName) {
+		return nil, fmt.Errorf("%q is not an allowed role", input.RoleName)
+	}
+
+	// Get the Database object
+	db, err := b.GetConnection(ctx, s, input.Role.DBName)
+	if err != nil {
+		return nil, err
+	}
+
+	// if there's a WAL ID / password we use that, otherwise we create a WAL and
+	// generate a password
+	newPassword := input.Password
+	if newPassword == "" {
+		// Generate a new password
+		newPassword, err = db.GenerateCredentials(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	db.RLock()
+	defer db.RUnlock()
+
+	config := dbplugin.StaticUserConfig{
+		Username: input.Role.StaticAccount.Username,
+		Password: newPassword,
+	}
+
+	// Create or rotate the user
+	stmts := input.Role.Statements.Creation
+	if !input.CreateUser {
+		stmts = input.Role.Statements.Rotation
+	}
+
+	var sterr error
+	_, password, _, sterr := db.SetCredentials(ctx, config, stmts)
+	if sterr != nil {
+		b.CloseIfShutdown(db, sterr)
+		return nil, sterr
+	}
+
+	// TODO set credentials doesn't need to return all these things
+	if newPassword != password {
+		return nil, errors.New("mismatch password returned")
+	}
+
+	// Store updated role information
+	lvr = time.Now()
+	input.Role.StaticAccount.LastVaultRotation = lvr
+	input.Role.StaticAccount.Password = password
+
+	entry, err := logical.StorageEntryJSON("role/"+input.RoleName, input.Role)
+	if err != nil {
+		return &setPasswordResponse{RotationTime: lvr}, err
+	}
+	if err := s.Put(ctx, entry); err != nil {
+		return &setPasswordResponse{RotationTime: lvr}, err
+	}
+
+	// TODO pop/add to queue
+
+	return &setPasswordResponse{RotationTime: lvr}, nil
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
 	"github.com/hashicorp/vault/plugins/helper/database/dbutil"
-	"github.com/mitchellh/mapstructure"
 )
 
 const (
@@ -298,6 +297,10 @@ func (b *databaseBackend) initQueue(ctx context.Context, conf *logical.BackendCo
 	}
 }
 
+func itemFromWal(ctx context.Context, conf *logical.BackendConfig, walID string) (*walSetCredentials, error) {
+	return nil, nil
+}
+
 // queueWAL reads WAL entries at backend initialization. If WAL entries for
 // static account rotation are round, attempt to re-set the password for the
 // role given the NewPassword stored in the WAL. If the matching Role does not
@@ -315,26 +318,13 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 
 	// loop through WAL keys and process any rotation ones
 	var merr error
-	for _, k := range keys {
-		var walEntry walSetCredentials
-		wal, err := framework.GetWAL(ctx, conf.StorageView, k)
-		if err != nil {
-			merr = multierror.Append(merr, err)
-			continue
-		}
-		if wal == nil {
+	for _, walID := range keys {
+		walEntry := b.walForItemValue(ctx, conf.StorageView, walID)
+		if walEntry == nil {
 			continue
 		}
 
-		if wal.Kind != walRotationKey {
-			continue
-		}
-
-		if mapErr := mapstructure.Decode(wal.Data, &walEntry); err != nil {
-			b.Logger().Warn("error decoding walEntry", mapErr.Error())
-			continue
-		}
-
+		// TODO: just use createUpdateStaticAccount
 		// load matching role and verify
 		role, err := b.Role(ctx, conf.StorageView, walEntry.RoleName)
 		if err != nil {
@@ -345,7 +335,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 
 		if role == nil || role.StaticAccount == nil {
 			b.Logger().Warn("role or static account not found")
-			if err = framework.DeleteWAL(ctx, conf.StorageView, k); err != nil {
+			if err = framework.DeleteWAL(ctx, conf.StorageView, walID); err != nil {
 				b.Logger().Warn("error deleting WAL for role with no static account", err)
 				merr = multierror.Append(merr, err)
 			}
@@ -355,7 +345,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 		if role.StaticAccount.LastVaultRotation.After(walEntry.LastVaultRotation) {
 			// role password has been rotated since the WAL was created, so let's
 			// delete this
-			err = framework.DeleteWAL(ctx, conf.StorageView, k)
+			err = framework.DeleteWAL(ctx, conf.StorageView, walID)
 			if err != nil {
 				merr = multierror.Append(merr, err)
 			}
@@ -373,7 +363,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 			// If role name isn't in the database's allowed roles, delete the WAL
 			if !strutil.StrListContains(dbConfig.AllowedRoles, "*") && !strutil.StrListContainsGlob(dbConfig.AllowedRoles, walEntry.RoleName) {
 				b.Logger().Warn("error getting database configuration")
-				err = framework.DeleteWAL(ctx, conf.StorageView, k)
+				err = framework.DeleteWAL(ctx, conf.StorageView, walID)
 				if err != nil {
 					b.Logger().Warn("error deleting WAL", err)
 				}
@@ -387,7 +377,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 			db, err := b.GetConnection(ctx, conf.StorageView, role.DBName)
 			if err != nil {
 				b.Logger().Warn("error getting database connection", err)
-				err = framework.DeleteWAL(ctx, conf.StorageView, k)
+				err = framework.DeleteWAL(ctx, conf.StorageView, walID)
 				if err != nil {
 					b.Logger().Warn("error deleting WAL", err)
 				}
@@ -408,7 +398,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 				// Add back on to queue with WALID
 				if err := b.credRotationQueue.PushItem(&queue.Item{
 					Key:   walEntry.RoleName,
-					Value: wal.ID,
+					Value: walEntry.ID,
 					// add a backoff
 					Priority: role.StaticAccount.LastVaultRotation.Add(time.Second * 10).Unix(),
 				}); err != nil {
@@ -433,7 +423,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 			// Add back on to queue with WALID
 			if err := b.credRotationQueue.PushItem(&queue.Item{
 				Key:   walEntry.RoleName,
-				Value: wal.ID,
+				Value: walID,
 				// add a backoff
 				Priority: role.StaticAccount.LastVaultRotation.Add(time.Second * 10).Unix(),
 			}); err != nil {
@@ -443,7 +433,7 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 		}
 
 		// handle WAL
-		if err := framework.DeleteWAL(ctx, conf.StorageView, k); err != nil {
+		if err := framework.DeleteWAL(ctx, conf.StorageView, walID); err != nil {
 			merr = multierror.Append(merr, err)
 		}
 	}
@@ -592,6 +582,7 @@ func (b *databaseBackend) runTicker(ctx context.Context, s logical.Storage) {
 // walSetCredentials is used to store information in a WAL that can retry a
 // credential setting or rotation in the event of partial failure.
 type walSetCredentials struct {
+	ID                string
 	Username          string
 	NewPassword       string
 	OldPassword       string
