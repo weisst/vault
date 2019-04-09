@@ -582,12 +582,15 @@ func (b *databaseBackend) runTicker(ctx context.Context, s logical.Storage) {
 // walSetCredentials is used to store information in a WAL that can retry a
 // credential setting or rotation in the event of partial failure.
 type walSetCredentials struct {
-	ID                string
+	// TODO: need this?
+	ID       string
+	Attempts int
+	//
+
 	Username          string
 	NewPassword       string
 	OldPassword       string
 	RoleName          string
 	Statements        []string
 	LastVaultRotation time.Time
-	Attempts          int
 }

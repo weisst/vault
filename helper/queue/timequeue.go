@@ -88,8 +88,6 @@ func (tq *TimeQueue) PopItemByKey(key string) (*Item, error) {
 		return i, nil
 	}
 
-	// TODO log that we found something but it wasn't an Item. Or just not bother
-	// type asserting
 	return nil, NewErrItemNotFound(key)
 }
 

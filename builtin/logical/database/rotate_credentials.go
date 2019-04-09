@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/hashicorp/errwrap"
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/vault/builtin/logical/database/dbplugin"
 	"github.com/hashicorp/vault/helper/queue"
 	"github.com/hashicorp/vault/helper/strutil"
@@ -48,10 +50,11 @@ func (b *databaseBackend) rotateCredentials(ctx context.Context, s logical.Stora
 			}
 
 			// check for existing WAL entry with a Password
-			if value, ok := item.Value.(string); ok {
-				walEntry := b.walForItemValue(ctx, s, value)
+			if walID, ok := item.Value.(string); ok {
+				walEntry := b.walForItemValue(ctx, s, walID)
 				if walEntry != nil && walEntry.NewPassword != "" {
 					input.Password = walEntry.NewPassword
+					input.WALID = walID
 				}
 			}
 
@@ -64,6 +67,12 @@ func (b *databaseBackend) rotateCredentials(ctx context.Context, s logical.Stora
 					Key:      item.Key,
 					Priority: item.Priority + 10,
 				}
+
+				// preserve the WALID if it was returned
+				if resp.WALID != "" {
+					newItem.Value = resp.WALID
+				}
+
 				if err := b.credRotationQueue.PushItem(&newItem); err != nil {
 					b.logger.Warn("unable to push item on to queue", "error", err)
 				}
@@ -134,31 +143,36 @@ type setPasswordResponse struct {
 
 func (b *databaseBackend) createUpdateStaticAccount(ctx context.Context, s logical.Storage, input *setPasswordInput) (*setPasswordResponse, error) {
 	var lvr time.Time
+	var merr error
+	// re-use WAL ID if present, otherwise PUT a new WAL
+	setResponse := &setPasswordResponse{WALID: input.WALID}
+
 	dbConfig, err := b.DatabaseConfig(ctx, s, input.Role.DBName)
 	if err != nil {
-		return nil, err
+		return setResponse, err
 	}
 
 	// If role name isn't in the database's allowed roles, send back a
 	// permission denied.
 	if !strutil.StrListContains(dbConfig.AllowedRoles, "*") && !strutil.StrListContainsGlob(dbConfig.AllowedRoles, input.RoleName) {
-		return nil, fmt.Errorf("%q is not an allowed role", input.RoleName)
+		return setResponse, fmt.Errorf("%q is not an allowed role", input.RoleName)
 	}
 
 	// Get the Database object
 	db, err := b.GetConnection(ctx, s, input.Role.DBName)
 	if err != nil {
-		return nil, err
+		return setResponse, err
 	}
 
-	// if there's a WAL ID / password we use that, otherwise we create a WAL and
-	// generate a password
+	// Use password from input if available. This happens if we're restoring from
+	// a WAL item or processing the rotation queue with an item that has a WAL
+	// associated with it
 	newPassword := input.Password
 	if newPassword == "" {
 		// Generate a new password
 		newPassword, err = db.GenerateCredentials(ctx)
 		if err != nil {
-			return nil, err
+			return setResponse, err
 		}
 	}
 
@@ -176,32 +190,51 @@ func (b *databaseBackend) createUpdateStaticAccount(ctx context.Context, s logic
 		stmts = input.Role.Statements.Rotation
 	}
 
+	if setResponse.WALID == "" {
+		setResponse.WALID, err = framework.PutWAL(ctx, s, walRotationKey, &walSetCredentials{
+			RoleName:          input.RoleName,
+			Username:          config.Username,
+			NewPassword:       config.Password,
+			OldPassword:       input.Role.StaticAccount.Password,
+			Statements:        stmts,
+			LastVaultRotation: input.Role.StaticAccount.LastVaultRotation,
+		})
+		if err != nil {
+			// TODO: error wrap here?
+			return setResponse, errwrap.Wrapf("error writing WAL entry: {{err}}", err)
+		}
+	}
+
 	var sterr error
 	_, password, _, sterr := db.SetCredentials(ctx, config, stmts)
 	if sterr != nil {
 		b.CloseIfShutdown(db, sterr)
-		return nil, sterr
+		return setResponse, sterr
 	}
 
 	// TODO set credentials doesn't need to return all these things
 	if newPassword != password {
-		return nil, errors.New("mismatch password returned")
+		return setResponse, errors.New("mismatch password returned")
 	}
 
 	// Store updated role information
 	lvr = time.Now()
 	input.Role.StaticAccount.LastVaultRotation = lvr
 	input.Role.StaticAccount.Password = password
+	setResponse.RotationTime = lvr
 
 	entry, err := logical.StorageEntryJSON("role/"+input.RoleName, input.Role)
 	if err != nil {
-		return &setPasswordResponse{RotationTime: lvr}, err
+		return setResponse, err
 	}
 	if err := s.Put(ctx, entry); err != nil {
-		return &setPasswordResponse{RotationTime: lvr}, err
+		return setResponse, err
 	}
 
-	// TODO pop/add to queue
+	// cleanup WAL after successfully rotating and pushing new item on to queue
+	if err := framework.DeleteWAL(ctx, s, input.WALID); err != nil {
+		merr = multierror.Append(merr, err)
+	}
 
-	return &setPasswordResponse{RotationTime: lvr}, nil
+	return setResponse, merr
 }
