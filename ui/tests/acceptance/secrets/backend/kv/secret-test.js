@@ -378,7 +378,7 @@ module('Acceptance | secrets/secret/create', function(hooks) {
     await authPage.login(userToken);
 
     await showPage.visit({ backend, id: 'secret' });
-    // TODO assert that it shows the empty state and an edit button
+    assert.ok(showPage.noReadIsPresent, 'shows no read empty state');
     assert.ok(showPage.editIsPresent, 'shows the edit button');
 
     await editPage.visitEdit({ backend, id: 'secret' });
@@ -399,7 +399,7 @@ module('Acceptance | secrets/secret/create', function(hooks) {
     await authPage.login(userToken);
 
     await showPage.visit({ backend, id: 'secret' });
-    // TODO assert that it shows the empty state and an edit button
+    assert.ok(showPage.noReadIsPresent, 'shows no read empty state');
     assert.ok(showPage.editIsPresent, 'shows the edit button');
 
     await editPage.visitEdit({ backend, id: 'secret' });
@@ -420,7 +420,7 @@ module('Acceptance | secrets/secret/create', function(hooks) {
     await authPage.login(userToken);
 
     await showPage.visit({ backend, id: 'secret' });
-    // TODO assert that it shows the empty state and an edit button
+    assert.ok(showPage.noReadIsPresent, 'shows no read empty state');
     assert.ok(showPage.editIsPresent, 'shows the edit button');
 
     await editPage.visitEdit({ backend, id: 'secret' });
